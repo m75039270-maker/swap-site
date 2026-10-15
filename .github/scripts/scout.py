@@ -13,17 +13,19 @@ OUT = Path("moneybot-scout-output")
 OUT.mkdir(exist_ok=True)
 MIN_USD = 20.0
 MAX_HOURS = 3.0
-REWARD_PATTERNS = [
-    re.compile(r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)", re.I),
-    re.compile(r"\bUSD\s*([0-9][0-9,]*(?:\.\d{1,2})?)\b", re.I),
-    re.compile(r"\b([0-9][0-9,]*(?:\.\d{1,2})?)\s*USD\b", re.I),
-]
+MONEY = re.compile(r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)", re.I)
+BODY_REWARD = re.compile(r"\b(?:bounty|prize|reward|budget|compensation)\b[^\n$]{0,35}\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)", re.I)
 SIMPLE = re.compile(r"\b(docs?|documentation|readme|changelog|markdown|csv|json|regex|unit test|test coverage|typo|copy edit|small script|simple cli|small bug|formatting)\b", re.I)
-COMPLEX = re.compile(r"\b(remote code execution|exploit|security audit|smart contract|blockchain protocol|kernel|compiler|machine learning model|mobile app|rewrite|from scratch|production migration)\b", re.I)
-PAYOUT = re.compile(r"\b(payment is released|payment will be|payout|payable|paid on merge|paid upon merge|upon merge|after merge|after acceptance|after approval|paid when|reward will be paid)\b", re.I)
+COMPLEX = re.compile(r"\b(remote code execution|exploit|security audit|smart contract|blockchain protocol|kernel|compiler|machine learning model|mobile app|rewrite|from scratch|production migration|visuali[sz](?:er|ation)|network graph|interactive graph|all-pairs shortest path|floyd-warshall|real[- ]time|turnkey generator|multi[- ]component deliverable|full[- ]stack|dashboard|production pipeline|API integration)\b", re.I)
+PAYOUT = re.compile(
+    r"\b(?:payment|bounty|reward|prize|funds)\b.{0,60}\b(?:paid|released|sent|transferred|pays out)\b.{0,60}\b(?:upon|after|once|following|when)\b.{0,35}\b(?:merge|acceptance|approval|review|PR accepted)\b"
+    r"|\b(?:paid|released|sent|transferred)\s+(?:upon|after|once|following)\s+(?:merge|acceptance|approval|review)\b",
+    re.I | re.S,
+)
 ACCEPTANCE = re.compile(r"\b(acceptance criteria|requirements?|expected behavior|must|required|should|deliverable|steps to reproduce|implement|create|add|fix|update|include)\b", re.I)
 ADVANCE = re.compile(r"\b(upfront fee|pay to apply|application fee|deposit\s+required|buy credits to apply|purchase credits to claim)\b", re.I)
 NEGATED_FEE = re.compile(r"\b(?:no|without|never|not requiring|does not require|doesn't require)\s+(?:any\s+)?(?:upfront fee|application fee|deposit|paid credits)(?:\s+or\s+(?:any\s+)?(?:upfront fee|application fee|deposit|paid credits))*", re.I)
+EXPLICIT_ETA = re.compile(r"\b(?:ETA|estimated effort|time estimate|estimate)\s*[:=-]\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b", re.I)
 
 
 def now_iso() -> str:
@@ -41,7 +43,7 @@ def query_issues(query: str) -> list[dict]:
         headers={
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "MONEYBOT-Scout/1.0",
+            "User-Agent": "MONEYBOT-Scout/1.1",
             **({"Authorization": "Bearer " + os.environ["GITHUB_TOKEN"]} if os.getenv("GITHUB_TOKEN") else {}),
         },
     )
@@ -50,14 +52,34 @@ def query_issues(query: str) -> list[dict]:
     return payload.get("items", [])
 
 
-def reward_amount(text: str):
-    for pattern in REWARD_PATTERNS:
-        match = pattern.search(text)
+def reward_amount(title: str, body: str) -> float | None:
+    # Prefer a number in the title; don't mistake dollar values in source code
+    # examples, wallet descriptions, or unrelated prose for an advertised reward.
+    if any(term in title.lower() for term in ("bounty", "reward", "prize", "paid")):
+        match = MONEY.search(title)
         if match:
             try:
                 return float(match.group(1).replace(",", ""))
             except ValueError:
                 pass
+    clean_body = re.sub(r"\x60\x60\x60.*?\x60\x60\x60", " ", body, flags=re.S)
+    clean_body = re.sub(r"\x60[^\x60]*\x60", " ", clean_body)
+    match = BODY_REWARD.search(clean_body)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+def explicit_hours(text: str) -> float | None:
+    match = EXPLICIT_ETA.search(text)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
     return None
 
 
@@ -66,7 +88,7 @@ def normalize(issue: dict) -> dict:
     body = issue.get("body") or ""
     full = title + "\n" + body
     low = full.lower()
-    rewards = reward_amount(full)
+    reward = reward_amount(title, body)
     labels = [item.get("name", "") for item in issue.get("labels", []) if isinstance(item, dict)]
     reasons = []
     created = issue.get("created_at") or ""
@@ -75,25 +97,34 @@ def normalize(issue: dict) -> dict:
         age = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400)
     except (ValueError, AttributeError):
         age = 999.0
-    hours = 2.0 if SIMPLE.search(full) and not COMPLEX.search(full) else (5.0 if COMPLEX.search(full) else 4.0)
-    if rewards is None:
-        reasons.append("no explicit USD/dollar reward amount")
-    elif rewards < MIN_USD:
+    stated_hours = explicit_hours(full)
+    if stated_hours is not None:
+        hours = stated_hours
+    elif COMPLEX.search(full):
+        hours = 5.0
+    elif SIMPLE.search(full):
+        hours = 2.0
+    else:
+        hours = 4.0
+    if reward is None:
+        reasons.append("no explicit USD/dollar reward amount tied to bounty title or reward field")
+    elif reward < MIN_USD:
         reasons.append(f"reward below USD {MIN_USD:.0f}")
     if not any(term in low for term in ("bounty", "reward", "prize", "paid")):
         reasons.append("no explicit reward/bounty wording")
     if not PAYOUT.search(body):
-        reasons.append("payout-after-acceptance terms not explicit")
+        reasons.append("no specific payout-after-acceptance/merge terms found")
     if len(body.strip()) < 80 or not ACCEPTANCE.search(body):
         reasons.append("clear acceptance criteria not found")
-    if ADVANCE.search(NEGATED_FEE.sub("", full)):
+    fee_check = NEGATED_FEE.sub("", full)
+    if ADVANCE.search(fee_check):
         reasons.append("advance fee/deposit/paid credits mentioned")
     if int(issue.get("comments", 0) or 0) > 3:
         reasons.append("more than 3 comments; competition proxy exceeded")
     if age > 14:
         reasons.append(f"issue older than 14 days ({age:.1f})")
     if hours > MAX_HOURS:
-        reasons.append(f"estimated work exceeds {MAX_HOURS:.0f} hours")
+        reasons.append(f"estimated work exceeds {MAX_HOURS:.0f} hours ({hours:.1f} stated/estimated)")
     if not SIMPLE.search(full) or COMPLEX.search(full):
         reasons.append("not a clearly low-complexity task")
     if issue.get("assignee") or issue.get("assignees"):
@@ -102,12 +133,13 @@ def normalize(issue: dict) -> dict:
         reasons.append("proposal, eligibility, or security challenge is unclear")
     url = issue.get("html_url", "")
     repo_url = issue.get("repository_url", "")
+    currency = "USD_assumed_from_$" if reward is not None else None
     return {
         "lead_id": re.sub(r"[^a-zA-Z0-9_-]+", "-", url.lower()).strip("-")[-72:] or "unknown",
         "url": url,
         "title": title,
-        "budget": rewards,
-        "budget_currency": "USD_assumed_from_$" if rewards is not None and "$" in full else ("USD" if rewards is not None else None),
+        "budget": reward,
+        "budget_currency": currency,
         "deadline": None,
         "skills": labels,
         "can_autosolve": not reasons,
@@ -157,7 +189,7 @@ def main() -> int:
         "rejected": len(rejected),
         "errors": errors,
         "status": "ok" if not errors else ("partial" if candidates else "network_error"),
-        "owner_action": "Review leads.jsonl and verify bounty/payout terms manually; nothing is submitted automatically." if leads else "No qualified leads. Inspect rejected.jsonl and allow the next scheduled scan to retry.",
+        "owner_action": "Review leads.jsonl and verify the issue is still open, payout/eligibility are explicit, and no one has already claimed it. Nothing is submitted automatically." if leads else "No qualified leads. Inspect rejected.jsonl; next scheduled scan retries automatically.",
     }
     (OUT / "scan_status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(status, ensure_ascii=False))
