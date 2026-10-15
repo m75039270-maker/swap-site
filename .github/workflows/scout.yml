@@ -1,6 +1,11 @@
 name: MONEYBOT SCOUT — paid task discovery
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/scout.py'
+      - '.github/workflows/scout.yml'
   workflow_dispatch:
   schedule:
     - cron: '17 */6 * * *'
