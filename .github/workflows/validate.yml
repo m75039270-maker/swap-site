@@ -1,0 +1,43 @@
+name: Validate TabClean and SCOUT source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - '.github/scripts/scout.py'
+      - '.github/workflows/validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate HTML and inline JavaScript syntax
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          html = Path("index.html").read_text(encoding="utf-8")
+          assert "<title>TabClean" in html
+          assert "FileReader" in html
+          assert "download" in html
+          scripts = re.findall(r"<script>(.*?)</script>", html, flags=re.S)
+          assert scripts, "no inline script found"
+          Path("tabclean-check.js").write_text("\n".join(scripts), encoding="utf-8")
+          print(f"HTML OK, {len(html)} characters, {len(scripts)} script block(s)")
+          PY
+          node --check tabclean-check.js
+      - name: Validate SCOUT Python syntax
+        run: python -m py_compile .github/scripts/scout.py
